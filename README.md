@@ -16,6 +16,8 @@
   - **Gemma 4 E4B 오디오 피벗**(활성) — raw audio 직접 입력, OK-rate **82.4%**
   - **Qwen2.5-VL-7B QLoRA**(동결) — 전사 텍스트 기반, round3 OK-rate 82.1%
 - **적응형 리프레이밍** — YOLO 피사체 추적 크롭 + 4:3/4:5/9:16/16:9 레터박스
+- **인간 피드백 루프 (OK/NO)** — 발행 쇼츠를 사람이 검수·라벨링 → 재학습 데이터로 환류
+- **계층 발행 태깅** — 점수 신뢰도에 따라 고신뢰/보충/탐색 계층으로 구분 발행
 - **로컬 완결** — 다운로드→전사→하이라이트→편집→인코딩까지 12GB VRAM 1대에서 순차 실행
 
 ---
@@ -50,17 +52,20 @@ app/
 └── services/
     ├── video_service.py          # 다운로드 + 오디오 추출 (yt-dlp, FFmpeg, 4단 포맷 폴백)
     ├── analysis_service.py       # 전사(Whisper) + 하이라이트 추출 오케스트레이션
+    ├── feedback_service.py       # 사람 OK/NO 피드백 저장 (사유: 선택/경계/편집)
     ├── llm_highlight_extractor.py# LLM 프롬프트/호출/파싱
     ├── vlm_client.py             # 모델 셀렉터 — GEMMA_ENABLED 분기(Gemma 우선 / Qwen 폴백)
     ├── gemma_phase_inference.py  # Gemma e2e 회귀 추론 (30s 슬라이딩 윈도우 → hook_score)
     ├── gemma_audio_extractor.py  # 구간 오디오 추출 (Gemma 입력)
+    ├── gemma_sample.py           # Gemma 샘플 포맷 + 프롬프트/출력 공유 상수
     ├── phase2_inference.py       # Qwen 10초 클립 추론 (동결 스택)
     ├── frame_extractor.py        # 영상 프레임 추출 (start/end/fps 지정)
     ├── transcript_chunker.py     # 전사 청크 분할/재랭킹
     ├── editing_service.py        # 리프레이밍 + 자막 + 인코딩 오케스트레이션
     ├── reframe_engine.py         # 클립 추출 + YOLO 추적 + 적응형 크롭
     ├── letterbox_engine.py       # 콘텐츠 크롭 + 검정 여백, 캔버스 9:16 고정
-    └── subtitle_generator.py     # ASS 자막 + FFmpeg 합성/인코딩 (현재 발행 경로에서 skip)
+    ├── subtitle_generator.py     # ASS 자막 + FFmpeg 합성/인코딩 (현재 발행 경로에서 skip)
+    └── heatmap_collector.py      # "Most Replayed" 히트맵 수집 (채널 크롤 + 중복 스킵)
 
 scripts/                          # 학습·데이터·추론 도구 (레포 루트 gemma_* 스크립트 포함)
     ├── gemma_e2e_model.py        # e2e 회귀 모델 (타워 동결 + 언어층 QLoRA + 회귀 헤드)
@@ -69,6 +74,9 @@ scripts/                          # 학습·데이터·추론 도구 (레포 루
     ├── gemma_e2e_infer.py        # 로컬 12GB 추론 + 분포 판정
     ├── gemma_dataset_builder.py  # 데이터셋 빌드 (pos/neg, 30초, video_id dedup)
     ├── package_dataset.py        # 병합·셔플 + 영상 단위 eval split
+    ├── collect_heatmaps.py       # 히트맵 수집 CLI
+    ├── build_feedback_dataset.py # OK/NO 피드백 → 회귀 학습 JSONL 변환 (재학습 입력)
+    ├── migrate_feedback_columns.py # 기존 DB에 피드백 컬럼 추가 (일회성, idempotent)
     ├── measure_ok_rate.py        # OK-rate 측정 (model_version별, 95% CI)
     └── gemma_ok_breakdown.py     # 점수 밴드·탐색/활용·신뢰 계층 분해
 ```
@@ -88,6 +96,9 @@ scripts/                          # 학습·데이터·추론 도구 (레포 루
   `false` → Qwen `phase2_inference`(`LORA_PIPELINE=phase2`) 경로.
 - **Gemma 추론 흐름**: 영상 → 30초 슬라이딩 윈도우 → [프레임 + 오디오] → 마지막 hidden 마스크
   평균 풀링 → 회귀 헤드 → `hook_score`. 타임스탬프는 모델 출력이 아니라 **클립 윈도우에서 재구성**.
+- **계층 발행 태깅**: `GEMMA_PUBLISH_THRESHOLD=0.9` 기준으로 활용 픽을 `high [고신뢰]`(≥임계) /
+  `fill [보충]`(미만) / `explore [탐색]`(탐색 픽)으로 태깅해 발행. 고신뢰(≥0.9) 순도 87.1%
+  (엔딩 크레딧 오분류 제외 시 93.9%). `reason` 프리픽스와 `confidence_tier`로 UI(test.html)에 표시.
 - **격리 원칙**: Qwen 어댑터(round1/1b/2/3)와 모든 Gemma 라운드 산출물은 **삭제·덮어쓰기 금지**.
 
 ---
@@ -111,6 +122,29 @@ scripts/                          # 학습·데이터·추론 도구 (레포 루
 - **발행 화질(60일차 확정)**: 전체 실행은 1080p로 다운로드 — 실측 `1728×1080 h264 + 128kbps`.
   다운로드 로그가 상시 품질 게이트로 동작해 침묵 강등이 재발하지 않습니다.
 - **라벨링 경로는 480p** — 모델 입력이 336px라 프레임 품질 동일. 발행은 반드시 전체 실행(1080p) 경로.
+
+---
+
+## 인간 피드백 루프 (OK/NO)
+
+모델 개선의 핵심 순환. 발행된 쇼츠를 사람이 `test.html`에서 검수하고 라벨을 남기면,
+그 라벨이 다음 라운드의 회귀 학습 데이터가 됩니다.
+
+```
+발행 쇼츠 → 사람 검수 (OK / NO)
+  → NO 사유 입도 분리 (selection / boundary / editing)  ← feedback_service.py
+  → shorts 테이블에 feedback + train_sample_json 적재
+  → build_feedback_dataset.py 로 회귀 라벨(JSONL) 변환   (OK→상향, NO→하향 너지)
+  → 기존 데이터셋에 병합 → A100 재학습 → OK-rate 재측정
+```
+
+- **NO 사유 분리**: 경계 문제로 NO인데 선택 문제로 학습되는 **라벨 오염을 방지**.
+  `selection`(선택 오류)만 재학습에 반영, `boundary`/`editing`은 기본 제외.
+- **라벨 너지**: 고정 0.9/0.1이 아니라 윈도우 원점수 기준 상대 조정(±0.15) —
+  타깃 연속 분포를 유지해 **이진 붕괴를 방지**(Qwen·Gemma 양쪽에서 실증된 필수 조건).
+- **운영 국면의 역할 전환(59일차)**: 실전 소스는 히트맵·조회수가 없는 것이 기본이므로,
+  라벨링은 학습 재료가 아니라 **발행 전 품질 검수 필터**로 존속합니다.
+- **DB 마이그레이션**: 피드백 컬럼은 nullable ALTER로 안전 추가(`migrate_feedback_columns.py`, 재실행 가능).
 
 ---
 
@@ -233,11 +267,27 @@ python3 gemma_ok_breakdown.py
 **VRAM 사용량 (순차 로딩)**
 
 ```
-[Step 3] Whisper medium              ~5GB   → 언로드
-[Step 4] Gemma 4 E4B 4bit(회귀 추론)   ~6-8GB → 언로드 (release_vram + gc.collect)
-         / 또는 Qwen phase2 GGUF      ~5GB   → 언로드
-[Step 5] YOLOv8n                     ~1GB   → 언로드
+[Step 3] Whisper medium              ~5GB  → 언로드
+[Step 4] Gemma 4 E4B 4bit(회귀 추론)  ~6-8GB → 언로드 (release_vram + gc.collect)
+         / 또는 Qwen phase2 GGUF     ~5GB  → 언로드
+[Step 5] YOLOv8n                     ~1GB  → 언로드
 ```
+
+---
+
+## 데이터·산출물 자산
+
+| 경로 | 내용 |
+|---|---|
+| `data/heatmaps_merged.jsonl` | "Most Replayed" 히트맵 소스 (학습 정답 신호) |
+| `data/shorts_ai.db` | SQLite — 프로젝트/쇼츠/피드백 레코드 (model_version 태깅 포함) |
+| `data/feedback_media_gemma/` | Gemma 재학습용 프레임·오디오 (격리 보존) |
+| `data/feedback_frames/` | Qwen 스택 피드백 프레임 |
+| `models/gguf/gemma4/` | Gemma 로컬 추론 GGUF (Q4_K_M 베이스 + mmproj Q8_0) |
+| `models/lora/gemma4/round*/` | Gemma 라운드별 어댑터 (round18 = 최종, 전량 보존) |
+| `models/lora/heatmap_generator_round{1,1b,2,3}/` | Qwen 어댑터 (동결·보존) |
+
+> 두 스택의 어댑터·데이터셋은 **삭제·덮어쓰기 금지**가 원칙입니다.
 
 ---
 
@@ -249,6 +299,21 @@ python3 gemma_ok_breakdown.py
 - **잔여 구조적 약점**: 0.6대 점수 밴드 판별력 ~61% (가중치 문제 — 학습 없이 개선 대상)
 - **측정 표준**: `OK-rate = OK / (OK + 선택NO)`, `model_version`별 그룹·95% CI.
   Spearman(rho)은 사전 필터, OK-rate 분해가 최종 판정.
+
+---
+
+## 알려진 한계
+
+- **해상도 갭 (미해결)**: 라벨링은 480p, 최종 발행은 1080p인데 최종 처리 시 1080p 재다운로드가
+  없습니다. 자동 업그레이드 vs 현행 규칙 유지 사이에서 정책 결정 대기 중.
+- **0.6대 점수 밴드 (구조적)**: 판별력 ~61%. 오분류의 실체는 단순 상호작용·이동 등 게임플레이
+  표면 신호로, **가중치 문제라 학습 없이는 불변**. 운영에서는 선별 정책·캘리브레이션으로 완화.
+- **엔딩 크레딧 오분류 (임계값 면역)**: 오디오 주도 신호라 발행 임계를 0.95로 올려도 잔존.
+  포지션 하드코딩이 아니라 **데이터 경로(NO 라벨 재학습)로만** 해소하는 것이 원칙.
+- **실전 도메인 갭**: 실전 소스 영상은 히트맵·조회수가 없어 점수 분포가 압축(sd 0.080)됩니다.
+  절대 임계보다 **퍼센타일 하이브리드 선별**이 필요 — 운영 로드맵 1순위.
+- **자막 기능 보류**: ASS 카라오케 자막 코드는 보존돼 있으나 현재 발행 경로에서 skip.
+
 
 ---
 
@@ -269,3 +334,12 @@ python3 gemma_ok_breakdown.py
 | 50-57 | Gemma 추론 모듈, OK-rate 실측, 계층 발행, 오분류 분석 | ✅ |
 | 59 | **학습 국면 종료 선언** (round18 = 최종), 포트폴리오 3종, 레터박스 개편 | ✅ |
 | 60 | 발행 화질·음질 강등 사건 규명·해결 (`player_client=web` 제거) | ✅ |
+| — | 운영: 퍼센타일 하이브리드 선별, 점수 캘리브레이션, 발행 파이프라인 검증 | 🔜 |
+
+---
+
+## 개발 원칙
+
+- **개별 스크립트 300줄 이하** (초과 시 모듈 분리)
+- **MVA 단방향**: API → 서비스 → 레포지토리 → DB
+- **환경변수 하드코딩 금지** — 모든 설정은 `config.py`/`gemma_config.py` 경유
