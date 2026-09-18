@@ -67,18 +67,18 @@ app/
     ├── subtitle_generator.py     # ASS 자막 + FFmpeg 합성/인코딩 (현재 발행 경로에서 skip)
     └── heatmap_collector.py      # "Most Replayed" 히트맵 수집 (채널 크롤 + 중복 스킵)
 
-scripts/                          # 학습·데이터·추론 도구 (레포 루트 gemma_* 스크립트 포함)
+scripts/                          # 도구 스크립트 (실행 위치는 파일별 상이 — scripts/ 또는 레포 루트)
     ├── gemma_e2e_model.py        # e2e 회귀 모델 (타워 동결 + 언어층 QLoRA + 회귀 헤드)
     ├── gemma_e2e_collate.py      # e2e collate (라벨 누설 방지)
     ├── gemma_e2e_train.py        # A100 학습 (랭킹 손실 + MSE, 체크포인트 회전)
     ├── gemma_e2e_infer.py        # 로컬 12GB 추론 + 분포 판정
     ├── gemma_dataset_builder.py  # 데이터셋 빌드 (pos/neg, 30초, video_id dedup)
     ├── package_dataset.py        # 병합·셔플 + 영상 단위 eval split
-    ├── collect_heatmaps.py       # 히트맵 수집 CLI
+    ├── collect_heatmaps.py       # 히트맵 수집 CLI (uv run python -m scripts.collect_heatmaps)
     ├── build_feedback_dataset.py # OK/NO 피드백 → 회귀 학습 JSONL 변환 (재학습 입력)
     ├── migrate_feedback_columns.py # 기존 DB에 피드백 컬럼 추가 (일회성, idempotent)
-    ├── measure_ok_rate.py        # OK-rate 측정 (model_version별, 95% CI)
-    └── gemma_ok_breakdown.py     # 점수 밴드·탐색/활용·신뢰 계층 분해
+    ├── measure_ok_rate.py        # OK-rate 측정 — 레포 루트 실행 (python3 measure_ok_rate.py)
+    └── gemma_ok_breakdown.py     # 점수 밴드·탐색/활용·신뢰 계층 분해 — 레포 루트 실행
 ```
 
 ---
@@ -90,7 +90,7 @@ scripts/                          # 학습·데이터·추론 도구 (레포 루
 | 스택 | 브랜치 | 입력 | 런타임 | 최종 지표 | 상태 |
 |---|---|---|---|---|---|
 | **Gemma 4 E4B 오디오 피벗** | `feature/gemma4-audio` | 1fps 프레임 + 30s raw 오디오 | 4bit 로컬(회귀 헤드) | **OK-rate 82.4%** (652건, CI ±2.9%p) | 활성 |
-| **Qwen2.5-VL-7B QLoRA** | `feature/phase2-clip-training` | 10초 클립 프레임 + 전사 | llama-server GGUF + LoRA | round3 OK-rate 82.1% | 동결·보존 |
+| **Qwen2.5-VL-7B QLoRA** | `feature/phase2-clip-training` | 10초 클립 프레임 + 전사 | unsloth 4bit 네이티브 + LoRA | round3 OK-rate 82.1% | 동결·보존 |
 
 - **모델 셀렉터**: `GEMMA_ENABLED=true` → `gemma_phase_inference` 경로 우선.
   `false` → Qwen `phase2_inference`(`LORA_PIPELINE=phase2`) 경로.
@@ -100,6 +100,9 @@ scripts/                          # 학습·데이터·추론 도구 (레포 루
   `fill [보충]`(미만) / `explore [탐색]`(탐색 픽)으로 태깅해 발행. 고신뢰(≥0.9) 순도 87.1%
   (엔딩 크레딧 오분류 제외 시 93.9%). `reason` 프리픽스와 `confidence_tier`로 UI(test.html)에 표시.
 - **격리 원칙**: Qwen 어댑터(round1/1b/2/3)와 모든 Gemma 라운드 산출물은 **삭제·덮어쓰기 금지**.
+- **런타임 공통**: 두 스택의 활성 경로는 모두 **unsloth 4bit 네이티브 로드**입니다. 베이스 가중치는
+  런타임에 자동 다운로드되고 준비물은 **어댑터 디렉토리뿐**(Gemma는 회귀 헤드·정규화 통계 동봉).
+  GGUF/llama-server는 구 base·생성기(방안 C)·CE 프로브용 **레거시·선택 경로**입니다.
 
 ---
 
@@ -169,29 +172,35 @@ export NVM_DIR="$HOME/.nvm" && source "$NVM_DIR/nvm.sh" && nvm use 22
 cp .env.example .env
 ```
 
-### 2) 추론 모델 다운로드
+### 2) 추론 모델 준비
 
-**Gemma 스택 (활성 · 권장)** — Q4_K_M 베이스 + mmproj Q8_0(오디오 포함):
-
-```bash
-# 로컬 추론 자산 (models/gguf/gemma4/ 및 어댑터는 학습 산출물로 보존)
-uv run hf download unsloth/gemma-4-E4B-it-GGUF \
-    --include "*Q4_K_M*" --local-dir ./models/gguf/gemma4/
-uv run hf download unsloth/gemma-4-E4B-it-GGUF \
-    --include "*mmproj*Q8_0*" --local-dir ./models/gguf/gemma4/
-# .env에서 GEMMA_ENABLED=true, GEMMA_INFER_ADAPTER_DIR=<round18 최종 어댑터 경로>
-```
-
-**Qwen 스택 (동결 · 폴백)**:
+**활성 경로 (Gemma·Qwen 공통) — 별도 GGUF 다운로드 불필요.**
+unsloth가 실행 시 4bit 베이스를 자동 다운로드하므로, 어댑터 디렉토리만 준비하고 `.env`로 지정합니다.
 
 ```bash
-uv run hf download unsloth/Qwen2.5-VL-7B-Instruct-GGUF \
-    --include "*Q5_K_M*" --local-dir ./models/llm/
-uv run hf download unsloth/Qwen2.5-VL-7B-Instruct-GGUF \
-    --include "*mmproj*" --local-dir ./models/llm/
+# Gemma (활성) — round18 어댑터 디렉토리에 adapter + regression_head.pt + norm_stats.json
+#   .env: GEMMA_ENABLED=true, GEMMA_INFER_ADAPTER_DIR=<round18 최종 어댑터 경로>
+#   베이스 unsloth/gemma-4-E4B-it 4bit는 최초 실행 시 자동 다운로드
+
+# Qwen (동결·폴백) — LoRA 어댑터 디렉토리 지정
+#   .env: GEMMA_ENABLED=false, LORA_ENABLED=true, LORA_PIPELINE=phase2
+#   베이스 unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit는 자동 다운로드
 ```
 
-### 3) llama.cpp 빌드 (Qwen GGUF 경로용)
+**(선택) 레거시 GGUF 자산** — 구 base·생성기(방안 C)·CE 프로브 경로에서만 사용. 활성 추론엔 불필요:
+
+```bash
+# Qwen 기본 GGUF 모드 (llama-server)
+uv run hf download unsloth/Qwen2.5-VL-7B-Instruct-GGUF \
+    --include "*Q5_K_M*" --include "*mmproj*" --local-dir ./models/llm/
+# Gemma CE 프로브 GGUF (42일차 확립, 회귀 헤드 경로 아님 → 참고 보존)
+uv run hf download unsloth/gemma-4-E4B-it-GGUF \
+    --include "*Q4_K_M*" --include "*mmproj*Q8_0*" --local-dir ./models/gguf/gemma4/
+```
+
+### 3) (선택) llama.cpp 빌드 — 레거시 GGUF 경로용
+
+활성 추론(unsloth 4bit)에는 **불필요**. 위 "레거시 GGUF 자산"을 쓰는 경우에만 빌드합니다.
 
 ```bash
 # GPU 아키텍처에 맞게 CUDA_ARCHITECTURES 조정
@@ -268,8 +277,8 @@ python3 gemma_ok_breakdown.py
 
 ```
 [Step 3] Whisper medium              ~5GB  → 언로드
-[Step 4] Gemma 4 E4B 4bit(회귀 추론)  ~6-8GB → 언로드 (release_vram + gc.collect)
-         / 또는 Qwen phase2 GGUF     ~5GB  → 언로드
+[Step 4] Gemma 4 E4B 4bit(회귀 추론)  ~5.5GB → 언로드 (PLE를 CPU 오프로드, release_vram+gc.collect)
+         / 또는 Qwen phase2 4bit     ~5-6GB → 언로드
 [Step 5] YOLOv8n                     ~1GB  → 언로드
 ```
 
@@ -283,9 +292,11 @@ python3 gemma_ok_breakdown.py
 | `data/shorts_ai.db` | SQLite — 프로젝트/쇼츠/피드백 레코드 (model_version 태깅 포함) |
 | `data/feedback_media_gemma/` | Gemma 재학습용 프레임·오디오 (격리 보존) |
 | `data/feedback_frames/` | Qwen 스택 피드백 프레임 |
-| `models/gguf/gemma4/` | Gemma 로컬 추론 GGUF (Q4_K_M 베이스 + mmproj Q8_0) |
+| `models/lora/gemma4/round18/` | **활성 추론 자산** — round18 어댑터 + `regression_head.pt` + `norm_stats.json` |
 | `models/lora/gemma4/round*/` | Gemma 라운드별 어댑터 (round18 = 최종, 전량 보존) |
-| `models/lora/heatmap_generator_round{1,1b,2,3}/` | Qwen 어댑터 (동결·보존) |
+| `models/lora/heatmap_generator_round{1,1b,2,3}/` | Qwen 어댑터 (동결·보존, `.env`→round3) |
+| `models/gguf/gemma4/` | (레거시) 구 CE 프로브 GGUF — 회귀 헤드 경로 아님, 참고 보존 |
+| `models/llm/` | (레거시) Qwen 기본 GGUF + mmproj (llama-server 경로) |
 
 > 두 스택의 어댑터·데이터셋은 **삭제·덮어쓰기 금지**가 원칙입니다.
 
